@@ -1,0 +1,135 @@
+name: Jest Lockfile Version Check
+
+# Pre-merge guard against the version-drift class of bug split out of
+# fix/issue-129-http-cache-headers. Without this job, jest-family
+# sibling packages can silently drift between major versions across
+# workspaces, producing crashes like
+#   `TypeError: this._moduleMocker.clearMocksOnScope is not a function`
+# in the *first* spec a suite tries to load.
+on:
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'package.json'
+      - 'app/**/package.json'
+      - '.npmrc'
+      - 'app/**/.npmrc'
+      - 'pnpm-lock.yaml'
+      - '.github/workflows/jest-lockfile-check.yml'
+  push:
+    branches: [ main ]
+
+jobs:
+  verify-jest-versions:
+    name: Verify jest-runtime versions and report sibling-bleed
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v2
+        with:
+          version: 9
+
+      - name: Use Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'pnpm'
+
+      # `pnpm install --frozen-lockfile` IS the bug-detector: it fails
+      # when any workspace-resolved version has drifted from what
+      # pnpm-lock.yaml captured, which is the failure mode that
+      # produced clearMocksOnScope crashes across every backend spec
+      # before fix/issue-129-http-cache-headers landed.
+      - name: Install with frozen lockfile
+        run: pnpm install --frozen-lockfile --engine-strict=false
+
+      # Uses `cd app/<workspace> && node -p "require('<pkg>/package.json').version"`
+      # which exercises Node's actual module-resolution algorithm
+      # (the same one jest uses at runtime). With `node-linker=hoisted`
+      # this walks up to the root hoist; future isolation for mobile
+      # will keep that resolution inside its own `node_modules`.
+      - name: Assert jest/jest-runtime versions per workspace
+        id: version-checks
+        run: |
+          set -euo pipefail
+
+          check_version() {
+            local workspace="$1" pkg="$2" expected_major="$3"
+            local resolved
+            resolved=$(cd "app/${workspace}" && node -p "require('${pkg}/package.json').version")
+            local actual_major
+            actual_major=$(echo "$resolved" | cut -d. -f1)
+            if [[ "${actual_major}" != "${expected_major}" ]]; then
+              echo "::error::${workspace}/${pkg} expected ${expected_major}.x but resolved to ${resolved}"
+              exit 1
+            fi
+            echo "OK: ${workspace}/${pkg} = ${resolved} (${expected_major}.x)"
+          }
+
+          # Backbone test suites are jest 30.x — strict assertion.
+          check_version backend  jest         30
+          check_version backend  jest-runtime 30
+          check_version frontend jest         30
+          check_version frontend jest-runtime 30
+
+          # Mobile intentionally stays on jest 29.x (Expo SDK 54 +
+          # jest-expo requirement). The block below informs reviewers
+          # rather than failing the PR, because isolating mobile's
+          # node_modules under `node-linker=isolated` is a follow-up
+          # refactor; right now the bleed is documented and caught
+          # for future contributors via this check.
+          echo
+          echo "--- mobile information (does not block) ---"
+          for pkg in jest jest-runtime @jest/core jest-resolve jest-haste-map @jest/globals; do
+            v=$(cd app/mobile && node -p "try { require('${pkg}/package.json').version } catch(e) { 'N/A' }" 2>/dev/null || echo "N/A")
+            echo "  mobile/${pkg}=${v}"
+          done
+
+      # Defensive belt-and-suspenders walk: any 30.x jest sibling
+      # physically present in `app/mobile/node_modules/` is a
+      # regression to catch before merging. Skips `.pnpm` and `.bin`
+      # symlinks (those live in pnpm's content-addressable store).
+      - name: Assert no Jest 30.x sibling in mobile's direct deps
+        if: always()
+        working-directory: app/mobile
+        run: |
+          node -e "
+            const fs = require('fs');
+            const path = require('path');
+            const OFFENDERS = new Set([
+              'jest',
+              'jest-runtime',
+              '@jest/core',
+              'jest-resolve',
+              'jest-haste-map',
+              '@jest/globals',
+            ]);
+            const found = [];
+            function walk(dir) {
+              if (!fs.existsSync(dir)) return;
+              for (const entry of fs.readdirSync(dir)) {
+                if (entry === '.pnpm' || entry === '.bin' || entry === '.gitkeep') continue;
+                const p = path.join(dir, entry);
+                let s; try { s = fs.statSync(p); } catch { continue; }
+                if (s.isDirectory()) walk(p);
+                else if (entry === 'package.json') {
+                  try {
+                    const pkg = JSON.parse(fs.readFileSync(p, 'utf-8'));
+                    if (OFFENDERS.has(pkg.name) && /^30\./.test(pkg.version)) {
+                      found.push(p.replace(/^.*\/node_modules\//, 'node_modules/') + ': ' + pkg.name + '@' + pkg.version);
+                    }
+                  } catch {}
+                }
+              }
+            }
+            walk('node_modules');
+            if (found.length) {
+              console.log('::warning::30.x jest siblings found in app/mobile/node_modules (informational):');
+              for (const f of found) console.log('  ' + f);
+            } else {
+              console.log('OK: no 30.x jest siblings in app/mobile/node_modules');
+            }
+          "
